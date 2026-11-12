@@ -1,0 +1,160 @@
+name: CI/CD Aplikasi Digital Kampus
+ 
+# Sesuai Bab VII: Push -> Build -> Test (unit, SAST, scan dependensi)
+# -> Image registry -> Deploy staging -> Persetujuan -> Deploy production
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+ 
+permissions:
+  contents: read
+ 
+concurrency:
+  group: ci-cd-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+ 
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
+ 
+jobs:
+  # 1. Unit test dan lint
+  test:
+    name: Unit test dan lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+      - run: npm ci
+      - run: npm run lint --if-present
+      - run: npm test --if-present
+ 
+  # 2. SAST (CodeQL)
+  sast:
+    name: SAST (CodeQL)
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      security-events: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: github/codeql-action/init@v3
+        with:
+          languages: javascript-typescript
+      - uses: github/codeql-action/analyze@v3
+ 
+  # 3. Scan dependensi
+  dependencies:
+    name: Scan dependensi
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+      - run: npm ci
+      - run: npm audit --audit-level=high
+      - uses: actions/dependency-review-action@v4
+        if: github.event_name == 'pull_request'
+        with:
+          fail-on-severity: high
+ 
+  # 4. Build image, scan image, push ke registry (push hanya dari main)
+  build:
+    name: Build dan push image
+    needs: [test, sast, dependencies]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    outputs:
+      tag: ${{ steps.meta.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          tags: |
+            type=sha,format=short
+            type=raw,value=latest,enable={{is_default_branch}}
+      - name: Build image (lokal, untuk di-scan)
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          load: true
+          tags: ${{ env.IMAGE_NAME }}:scan
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+      - name: Scan image dengan Trivy
+        uses: aquasecurity/trivy-action@0.28.0
+        with:
+          image-ref: ${{ env.IMAGE_NAME }}:scan
+          severity: CRITICAL,HIGH
+          ignore-unfixed: true
+          exit-code: "1"
+      - name: Login ke GHCR
+        if: github.event_name != 'pull_request'
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Push image
+        if: github.event_name != 'pull_request'
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+ 
+  # 5. Deploy staging (otomatis setelah merge ke main)
+  deploy-staging:
+    name: Deploy ke staging
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: staging
+      url: https://staging.example.ac.id
+    steps:
+      - uses: actions/checkout@v4
+      - name: Deploy
+        run: |
+          echo "Deploy image ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ needs.build.outputs.tag }} ke staging"
+          # TODO: ganti dengan perintah deploy nyata, contoh:
+          # kubectl set image deployment/akademik app=$IMAGE -n staging
+          # kubectl rollout status deployment/akademik -n staging --timeout=300s
+      - name: Smoke test
+        run: |
+          echo "Jalankan uji integrasi/UAT dan load test (k6) terhadap staging"
+          # TODO: curl --fail https://staging.example.ac.id/health
+ 
+  # 6. Deploy production (menunggu persetujuan Operations lewat Environment protection rules)
+  deploy-production:
+    name: Deploy ke production
+    needs: [build, deploy-staging]
+    runs-on: ubuntu-latest
+    environment:
+      name: production
+      url: https://akademik.example.ac.id
+    steps:
+      - uses: actions/checkout@v4
+      - name: Deploy (rolling)
+        run: |
+          echo "Deploy image ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ needs.build.outputs.tag }} ke production"
+          # TODO: kubectl set image ... && kubectl rollout status ...
+      - name: Health check dan rollback otomatis
+        run: |
+          echo "Cek health endpoint; bila gagal jalankan rollback"
+          # TODO: curl --fail https://akademik.example.ac.id/health || kubectl rollout undo deployment/akademik
